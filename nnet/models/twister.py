@@ -874,7 +874,7 @@ class TWISTER(models.Model):
                 feats_model=feats_model_proj,
                 feats_state=feats_state_proj,
                 feats_state_aug=feats_state_aug_proj,
-                window=self.config.contrastive_window if hasattr(self.config, "contrastive_window") else 3
+                window=self.config.get("contrastive_window", 3)
             )
 
             # Add Loss and Metric
@@ -1198,15 +1198,18 @@ class TWISTER(models.Model):
                         mask[anchor_idx, pos_idx_aug] = True
 
         # Compute log-softmax for each anchor
-        logsumexp_all = torch.logsumexp(sim_matrix, dim=-1)
-        
-        # Positive similarities
-        sim_pos = sim_matrix[mask].reshape(B * L, -1)  # each row: multiple positives
-        logsumexp_pos = torch.logsumexp(sim_pos, dim=-1)
+        logsumexp_all = torch.logsumexp(sim_matrix, dim=-1)  # (B*L,)
 
-        # InfoNCE-like loss: encourage high sim for positives
-        loss = -(logsumexp_pos - logsumexp_all)
-        loss = loss.mean()
+        # For each anchor, extract its positive similarities safely
+        losses = []
+        for i in range(B * L):
+            pos_sims = sim_matrix[i][mask[i]]  # variable-length positives
+            if pos_sims.numel() == 0:
+                continue
+            logsumexp_pos = torch.logsumexp(pos_sims, dim=-1)
+            losses.append(-(logsumexp_pos - lodgsumexp_all[i]))
+
+        loss = torch.stack(losses).mean()
 
         # Compute accuracy (anchor’s max sim belongs to any of its positives)
         preds = sim_matrix.argmax(dim=-1)
