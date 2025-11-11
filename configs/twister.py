@@ -40,3 +40,4 @@ model.set_replay_buffer(training_dataset)
 
 # Evaluation Dataset
 evaluation_dataset = nnet.datasets.VoidDataset(num_steps=model.config.eval_episodes)
+print(evaluation_dataset.batch_size)

@@ -1207,7 +1207,7 @@ class TWISTER(models.Model):
             if pos_sims.numel() == 0:
                 continue
             logsumexp_pos = torch.logsumexp(pos_sims, dim=-1)
-            losses.append(-(logsumexp_pos - lodgsumexp_all[i]))
+            losses.append(-(logsumexp_pos - logsumexp_all[i]))
 
         loss = torch.stack(losses).mean()
 
