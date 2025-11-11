@@ -37,20 +37,19 @@ class ContrastiveNetwork(nn.Module):
             dim_layers=[hidden_size for _ in range(num_layers-1)] + [out_size], 
             act_fun=act_fun
         )
-        self.mlp_embed = modules.MultiLayerPerceptron(
-            dim_input=embed_size, 
-            dim_layers=[hidden_size for _ in range(num_layers-1)] + [out_size], 
-            act_fun=act_fun
-        )
+        # self.mlp_embed = modules.MultiLayerPerceptron(
+        #     dim_input=embed_size, 
+        #     dim_layers=[hidden_size for _ in range(num_layers-1)] + [out_size], 
+        #     act_fun=act_fun
+        # )
 
-    def forward(self, feats, embed1, embed2):
+    def forward(self, feats1, feats2):
 
         # print(feats.shape, embed.shape)
 
         # MLP Layers
-        x = self.mlp_feats(feats)
-        y = self.mlp_embed(embed1)
-        z = self.mlp_embed(embed2)
+        x = self.mlp_feats(feats1)
+        y = self.mlp_feats(feats2)
 
-        return x, y, z
+        return x, y
     

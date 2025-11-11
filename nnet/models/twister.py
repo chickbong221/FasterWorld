@@ -29,6 +29,7 @@ import copy
 import itertools
 import os
 import glob
+import torch.nn.functional as F
 
 class TWISTER(models.Model):
 
@@ -813,6 +814,7 @@ class TWISTER(models.Model):
             ###############################################################################
 
             assert actions.shape[1] == self.config.L
+            B, L = actions.shape[:2]
 
             # Forward Representation Network (B, L, ...)
             latent = self.encoder_network(states)
@@ -848,36 +850,36 @@ class TWISTER(models.Model):
             # Flatten B and L to ensure different augmentation per sample (B*L, 3, H, W)
             states_flatten = states.flatten(0, 1)
 
-            # Augment each frame independently
-            states_aug = torch.stack(
-                [self.config.contrastive_augments(states_flatten[b]) for b in range(states_flatten.shape[0])],
-                dim=0
-            ).reshape(states.shape)
+            def _apply_aug(x):
+                return self.config.contrastive_augments(x)
 
-            # Encode both original and augmented images
-            posts_con_ori = self.encoder_network(states_flatten)
-            posts_con_aug = self.encoder_network(states_aug)
+            aug1_flat = torch.stack([_apply_aug(x) for x in states_flatten], dim=0)
+            aug2_flat = torch.stack([_apply_aug(x) for x in states_flatten], dim=0)
 
-            # Model latent features (predicted)
-            feats_model = self.rssm.get_feat(priors)
+            aug1 = aug1_flat.view(B, L, *states.shape[2:])
+            aug2 = aug2_flat.view(B, L, *states.shape[2:])
 
-            # Pass through contrastive projection network (resize/transform)
-            # Expect the network to take feats + two embeddings (original & augmented)
-            feats_model_proj, feats_state_proj, feats_state_aug_proj = self.contrastive_network[0](
-                feats=feats_model,
-                embed1=posts_con_ori["stoch"].flatten(-2, -1),
-                embed2=posts_con_aug["stoch"].flatten(-2, -1),
+            # === 2. Encode both augmented sequences ===
+            enc1 = self.encoder_network(aug1)
+            enc2 = self.encoder_network(aug2)
+
+            # === 3. Extract per-timestep features from RSSM ===
+            posts1, _ = self.rssm.observe(enc1, prev_actions=actions, is_firsts=is_firsts)
+            posts2, _ = self.rssm.observe(enc2, prev_actions=actions, is_firsts=is_firsts)
+            feats1 = self.rssm.get_feat(posts1)  # (B, L, D)
+            feats2 = self.rssm.get_feat(posts2)  # (B, L, D)
+
+            # === 4. Pass through contrastive network(s) ===
+            feats1, feats2 = self.contrastive_network[0](
+                feats1=feats1,
+                feats2=feats2,
             )
 
-            # Compute temporal contrastive loss
+            # === 5. Compute temporal contrastive loss ===
             info_nce_loss, acc_con = self.compute_temporal_contrastive_loss(
-                feats_model=feats_model_proj,
-                feats_state=feats_state_proj,
-                feats_state_aug=feats_state_aug_proj,
-                window=self.config.get("contrastive_window", 3)
+                feats1, feats2, window=self.config.get("contrastive_window", 1)
             )
 
-            # Add Loss and Metric
             self.add_loss(
                 name="model_contrastive",
                 loss=info_nce_loss,
@@ -1161,30 +1163,33 @@ class TWISTER(models.Model):
 
         return lambda_values
     
-    def compute_temporal_contrastive_loss(self, feats_model, feats_state, feats_state_aug, window=3):
+    def compute_temporal_contrastive_loss(self, feats_view1, feats_view2, window=1):
         """
-        feats_model: predicted latent features from RSSM (B, L, D)
-        feats_state: encoded true states (B, L, D)
-        feats_state_aug: encoded augmented true states (B, L, D)
-        window: temporal window for positives (+/- t)
+        Contrastive loss between two augmented sequences.
+
+        feats_view1, feats_view2: [B, L, D]
+            Latent features from the two augmented views.
+        window: int, temporal neighborhood for positives (±window)
         """
-        B, L, D = feats_model.shape
-        losses = []
-        accs = []
+        B, L, D = feats_view1.shape
 
-        # Flatten everything for similarity matrix
-        feats_model_flat = feats_model.reshape(B * L, D)                # anchors
-        feats_all_flat = torch.cat([
-            feats_state.reshape(B * L, D),
-            feats_state_aug.reshape(B * L, D)
-        ], dim=0)                                                       # positives + negatives
+        # Flatten
+        anchors = feats_view1.reshape(B * L, D)
+        feats_all = feats_view2.reshape(B * L, D)
 
-        # Compute similarity (dot product)
-        sim_matrix = feats_model_flat @ feats_all_flat.T  # (B*L, 2*B*L)
-        sim_matrix /= torch.sqrt(torch.tensor(D, device=sim_matrix.device))
+        # Normalize (cosine sim)
+        anchors = F.normalize(anchors, dim=-1)
+        feats_all = F.normalize(feats_all, dim=-1)
 
-        # Build mask of valid positives
-        mask = torch.zeros_like(sim_matrix, dtype=torch.bool)  # (B*L, 2*B*L)
+        # Compute similarity matrix
+        sim_matrix = anchors @ feats_all.T  # (B*L, B*L)
+
+        # Scale by temperature
+        temp = getattr(self.config, "contrastive_temp", 0.1)
+        sim_matrix = sim_matrix / temp
+
+        # Build positive mask
+        pos_mask = torch.zeros_like(sim_matrix, dtype=torch.bool)
 
         for b in range(B):
             for t in range(L):
@@ -1192,26 +1197,20 @@ class TWISTER(models.Model):
                 for dt in range(-window, window + 1):
                     tp = t + dt
                     if 0 <= tp < L:
-                        pos_idx_real = b * L + tp                # from feats_state
-                        pos_idx_aug = B * L + (b * L + tp)       # from feats_state_aug
-                        mask[anchor_idx, pos_idx_real] = True
-                        mask[anchor_idx, pos_idx_aug] = True
+                        pos_mask[anchor_idx, b * L + tp] = True
 
-        # Compute log-softmax for each anchor
+        # InfoNCE: multi-positive version
         logsumexp_all = torch.logsumexp(sim_matrix, dim=-1)  # (B*L,)
-
-        # For each anchor, extract its positive similarities safely
         losses = []
         for i in range(B * L):
-            pos_sims = sim_matrix[i][mask[i]]  # variable-length positives
+            pos_sims = sim_matrix[i][pos_mask[i]]
             if pos_sims.numel() == 0:
                 continue
             logsumexp_pos = torch.logsumexp(pos_sims, dim=-1)
             losses.append(-(logsumexp_pos - logsumexp_all[i]))
-
         loss = torch.stack(losses).mean()
 
-        # Compute accuracy (anchor’s max sim belongs to any of its positives)
+        # Accuracy: check if max similarity corresponds to any positive
         preds = sim_matrix.argmax(dim=-1)
         correct_mask = torch.zeros_like(preds, dtype=torch.bool)
         for b in range(B):
@@ -1219,10 +1218,9 @@ class TWISTER(models.Model):
                 anchor_idx = b * L + t
                 for dt in range(-window, window + 1):
                     tp = t + dt
-                    if 0 <= tp < L:
-                        if preds[anchor_idx] in [b * L + tp, B * L + (b * L + tp)]:
-                            correct_mask[anchor_idx] = True
-                            break
+                    if 0 <= tp < L and preds[anchor_idx] == b * L + tp:
+                        correct_mask[anchor_idx] = True
+                        break
         acc = correct_mask.float().mean()
 
         return loss, acc
@@ -1338,8 +1336,7 @@ class TWISTER(models.Model):
         # batch_losses, batch_metrics, batch_truths, batch_preds
         return {}, outputs, {}, {}
     
-    def log_figure(self, step, inputs, targets, writer, tag, save_image=False): 
-
+    def log_figure(self, step, inputs, targets, writer, tag, save_image=False):
         # Eval Mode
         mode = self.training
         self.eval()
@@ -1349,14 +1346,13 @@ class TWISTER(models.Model):
 
         # Unpack Inputs 
         states, actions, rewards, dones, is_firsts, model_steps = inputs
-        
+
         # Number of Rows
         states = states[:self.config.log_figure_batch]
         actions = actions[:self.config.log_figure_batch]
         is_firsts = is_firsts[:self.config.log_figure_batch]
 
         with torch.no_grad():
-
             # Forward Representation Network (B, L, D)
             latent = self.encoder_network(states)
 
@@ -1366,9 +1362,9 @@ class TWISTER(models.Model):
 
             # Model Observe (B, L, D)
             posts, priors = self.rssm.observe(
-                states=latent, 
-                prev_actions=actions, 
-                is_firsts=is_firsts, 
+                states=latent,
+                prev_actions=actions,
+                is_firsts=is_firsts,
                 prev_state=None,
                 is_firsts_hidden=None,
             )
@@ -1380,131 +1376,173 @@ class TWISTER(models.Model):
             states_rec = self.decoder_network(posts["stoch"].flatten(-2, -1)).mode()
 
             ###############################################################################
-            # Model Contrastive Loss
+            # Contrastive branch (two augmentations per sequence) + sorted indices
             ###############################################################################
 
-            # Flatten B and L to ensure diff augment for each sample (B*L, 3, H, W)
-            states_flatten = states.flatten(0, 1)
+            B, L = states.shape[0], states.shape[1]
+            states_flatten = states.flatten(0, 1)  # (B*L, C, H, W)
 
-            # Augment
-            states_aug_con = torch.stack([self.config.contrastive_augments(states_flatten[b]) for b in range(states_flatten.shape[0])], dim=0).reshape(states.shape)
+            # Create two independent augmentations per frame
+            aug1_flat = torch.stack(
+                [self.config.contrastive_augments(states_flatten[i]) for i in range(states_flatten.shape[0])],
+                dim=0
+            )
+            aug2_flat = torch.stack(
+                [self.config.contrastive_augments(states_flatten[i]) for i in range(states_flatten.shape[0])],
+                dim=0
+            )
 
-            # Forward
-            posts_con = self.encoder_network(states_aug_con)
+            # Reshape back to (B, L, C, H, W)
+            aug1 = aug1_flat.view(B, L, *states.shape[2:])
+            aug2 = aug2_flat.view(B, L, *states.shape[2:])
 
-            contrastive_sorted_indices = []
+            # Encode both augmented sequences through encoder -> RSSM.observe -> get_feat
+            enc1 = self.encoder_network(aug1)
+            enc2 = self.encoder_network(aug2)
 
-            for t in range(self.config.contrastive_steps):
+            posts1, _ = self.rssm.observe(
+                states=enc1,
+                prev_actions=actions,
+                is_firsts=is_firsts,
+                prev_state=None,
+                is_firsts_hidden=None,
+            )
+            posts2, _ = self.rssm.observe(
+                states=enc2,
+                prev_actions=actions,
+                is_firsts=is_firsts,
+                prev_state=None,
+                is_firsts_hidden=None,
+            )
 
-                # Action condition (B, L-t, A*t)
-                if t > 0:
-                    actions_cond = torch.cat([actions[:, 1+t_:min(actions.shape[1], actions.shape[1]+1+t_-t)] for t_ in range(t)], dim=-1)
+            feats1 = self.rssm.get_feat(posts1)  # (B, L, D)
+            feats2 = self.rssm.get_feat(posts2)  # (B, L, D)
 
-                # Contrastive features (B, L-t, D)
-                features_feats, features_embed = self.contrastive_network[t](
-                    feats=self.rssm.get_feat(priors) if t==0 else torch.cat([self.rssm.get_feat(priors)[:, :-t], actions_cond], dim=-1),
-                    embed=posts_con["stoch"].flatten(-2, -1) if t==0 else posts_con["stoch"].flatten(-2, -1)[:, t:]
-                )
+            # Optionally pass through projection head used by contrastive loss (if you have one)
+            if hasattr(self, "contrastive_proj") and self.contrastive_proj is not None:
+                feats1 = self.contrastive_proj(feats1)
+                feats2 = self.contrastive_proj(feats2)
 
-                def get_sorted_indices(features_x, features_y):
+            # Flatten for similarity computation (B*L, D)
+            feats1_flat = feats1.reshape(B * L, -1)
+            feats2_flat = feats2.reshape(B * L, -1)
 
-                    # Flatten (B', D)
-                    features_x = features_x.flatten(start_dim=0, end_dim=1)
-                    features_y = features_y.flatten(start_dim=0, end_dim=1)
+            # L2 normalize (cosine similarity)
+            feats1_flat_n = F.normalize(feats1_flat, dim=-1)
+            feats2_flat_n = F.normalize(feats2_flat, dim=-1)
 
-                    # Matmul (B', B')
-                    features = features_x.matmul(features_y.transpose(0, 1))
+            # similarity matrix (anchors = feats1, keys = feats2)
+            # shape (B*L, B*L)
+            temp = float(self.config.get("contrastive_temp", 0.1))
+            sim_matrix = (feats1_flat_n @ feats2_flat_n.T) / temp
 
-                    # Sort indices (B', B')
-                    sorted_indices = torch.argsort(features, dim=-1, descending=True)
-
-                    return sorted_indices
-                    
-                if features_feats.dtype != torch.float32:
-                    with torch.cuda.amp.autocast(enabled=False):
-                        contrastive_sorted_indices.append(get_sorted_indices(features_feats.type(torch.float32), features_embed.type(torch.float32)))
-                else:
-                    contrastive_sorted_indices.append(get_sorted_indices(features_feats, features_embed))
+            # Sorted indices (descending similarity)
+            sorted_indices = torch.argsort(sim_matrix, dim=-1, descending=True)  # (B*L, B*L)
 
             ###############################################################################
-            # Imaginary
+            # Imaginary (unchanged)
             ###############################################################################
 
             # Initial State
             if self.config.log_figure_context_frames == 0:
                 # No context, No hidden
-                prev_state = self.transfer_to_device(self.rssm.initial(batch_size=feats.shape[0], seq_length=1, dtype=feats.dtype))
+                prev_state = self.transfer_to_device(
+                    self.rssm.initial(batch_size=feats.shape[0], seq_length=1, dtype=feats.dtype)
+                )
             else:
                 # context + hidden
                 hidden_len = self.rssm.get_hidden_len(posts["hidden"])
                 prev_state = {k: [
                     (
-                        v_blk[0][:, max(0, hidden_len-self.config.L+self.config.log_figure_context_frames-self.config.att_context_left):hidden_len-self.config.L+self.config.log_figure_context_frames], 
-                        v_blk[1][:, max(0, hidden_len-self.config.L+self.config.log_figure_context_frames-self.config.att_context_left):hidden_len-self.config.L+self.config.log_figure_context_frames]
-                    ) for v_blk in v] if k == "hidden" else v[:, self.config.log_figure_context_frames-1:self.config.log_figure_context_frames] for k, v in posts.items()
+                        v_blk[0][:, max(0, hidden_len - self.config.L + self.config.log_figure_context_frames - self.config.att_context_left):hidden_len - self.config.L + self.config.log_figure_context_frames],
+                        v_blk[1][:, max(0, hidden_len - self.config.L + self.config.log_figure_context_frames - self.config.att_context_left):hidden_len - self.config.L + self.config.log_figure_context_frames]
+                    ) for v_blk in v] if k == "hidden" else v[:, self.config.log_figure_context_frames - 1:self.config.log_figure_context_frames] for k, v in posts.items()
                 }
 
             # Model Imagine (B, 1+L-C, D)
             img_states = self.rssm.imagine(
-                p_net=self.policy_network, 
-                prev_state=prev_state, 
-                img_steps=self.config.L-self.config.log_figure_context_frames,
+                p_net=self.policy_network,
+                prev_state=prev_state,
+                img_steps=self.config.L - self.config.log_figure_context_frames,
                 is_firsts=None,
                 is_firsts_hidden=None
             )
 
             # Img States (B, L, ...)
-            states_img = self.decoder_network(torch.cat([posts["stoch"][:, :self.config.log_figure_context_frames].flatten(-2, -1) , img_states["stoch"][:, 1:].flatten(-2, -1)], dim=1)).mode()
+            states_img = self.decoder_network(
+                torch.cat([posts["stoch"][:, :self.config.log_figure_context_frames].flatten(-2, -1),
+                        img_states["stoch"][:, 1:].flatten(-2, -1)], dim=1)
+            ).mode()
 
-        # Shift to 0 1
+        # Shift to 0..1 for display
         states_shift = states.clip(-0.5, 0.5) + 0.5
         states_rec_shift = states_rec.clip(-0.5, 0.5) + 0.5
         error_shift = 1 - torch.abs(states_rec_shift - states_shift).mean(dim=2, keepdim=True).repeat(1, 1, 3, 1, 1)
         states_img_shift = states_img.clip(-0.5, 0.5) + 0.5
-        
-        # Expand is Firsts
+
+        # Expand is_firsts
         is_firsts = is_firsts.unsqueeze(dim=-1).unsqueeze(dim=-1).unsqueeze(dim=-1).expand_as(states) * states_shift
 
-        # Concat Outputs
+        # Concat Outputs (same as before)
         outputs = torch.concat([
-            is_firsts, 
-            states_shift, 
-            states_rec_shift, 
-            error_shift, 
+            is_firsts,
+            states_shift,
+            states_rec_shift,
+            error_shift,
             states_img_shift,
         ], dim=1).flatten(start_dim=0, end_dim=1)
 
         # Add Figure to logs
-        if writer != None:
-
-            # Log Image
+        if writer is not None:
+            # Log Image (main)
             fig = torchvision.utils.make_grid(outputs, nrow=self.config.L, normalize=False, scale_each=False).cpu()
             writer.add_image(tag, fig, step)
 
-            # Log Contrastive: 
-            # for each contrastive t, log a figure of contrastive_batch random samples from the batch and their contrastive_most_less most sim state
-            # repeat with less similar
-            # end up with 2*contrastive_steps figures of contrastive_batch*contrastive_most_less images
-            states_aug_con = states_aug_con.flatten(start_dim=0, end_dim=1)
+            # Log Contrastive visualizations
+            # We'll visualize, for a set of random anchors, the anchor original frame + top-K and bottom-K matches from aug2.
+            states_orig_flat = states.flatten(start_dim=0, end_dim=1)    # (B*L, C, H, W)
+            states_aug1_flat = aug1_flat                                  # (B*L, C, H, W)
+            states_aug2_flat = aug2_flat                                  # (B*L, C, H, W)
 
-            for t in range(self.config.contrastive_steps):
+            contrastive_batch = min(10, sorted_indices.shape[0])         # how many anchors to visualize
+            contrastive_top_k = min(10, sorted_indices.shape[1])         # top-k to show
+            contrastive_bottom_k = min(10, sorted_indices.shape[1])
 
-                contrastive_batch = 10
-                contrastive_most_less = 10
+            # sample anchors uniformly
+            rng = torch.randint(0, sorted_indices.shape[0], size=(contrastive_batch,))
+            for t_idx, anchor_idx in enumerate(rng):
+                anchor_idx = int(anchor_idx.item())
+                top_idxs = sorted_indices[anchor_idx, :contrastive_top_k].cpu()
+                bottom_idxs = sorted_indices[anchor_idx, -contrastive_bottom_k:].cpu()
 
-                # select 10 samples from batch
-                samples_i = torch.randint(0, contrastive_sorted_indices[t].shape[0], size=(contrastive_batch,))
-                    
-                outputs_con = torch.cat([
-                    torch.cat([
-                        torch.cat([states.flatten(0, 1)[sample_i:sample_i+1], (contrastive_sorted_indices[t][sample_i, :contrastive_most_less] == sample_i).unsqueeze(dim=-1).unsqueeze(dim=-1).unsqueeze(dim=-1).expand_as(states.flatten(0, 1)[sample_i:sample_i+1].repeat(contrastive_most_less, 1, 1, 1)) * states.flatten(0, 1)[sample_i:sample_i+1].repeat(contrastive_most_less, 1, 1, 1)], dim=0),
-                        torch.cat([states.flatten(0, 1)[sample_i:sample_i+1], states_aug_con[contrastive_sorted_indices[t][sample_i, :contrastive_most_less]]], dim=0),
-                        torch.cat([states.flatten(0, 1)[sample_i:sample_i+1], states_aug_con[contrastive_sorted_indices[t][sample_i, -contrastive_most_less:]]], dim=0)
-                    ], dim=0)
-                for sample_i in samples_i], dim=0)
+                # Anchor original + its two augmentations (for context)
+                anchor_original = states_orig_flat[anchor_idx:anchor_idx + 1].cpu()
+                anchor_aug1 = states_aug1_flat[anchor_idx:anchor_idx + 1].cpu()
+                anchor_aug2 = states_aug2_flat[anchor_idx:anchor_idx + 1].cpu()
 
-                fig = torchvision.utils.make_grid(outputs_con, nrow=1+contrastive_most_less, normalize=True, scale_each=True).cpu()
-                writer.add_image(tag + "-contrastive-{}".format(t), fig, step)
+                # Top matches (from aug2)
+                top_matches = states_aug2_flat[top_idxs].cpu()  # (top_k, C, H, W)
+                bottom_matches = states_aug2_flat[bottom_idxs].cpu()
 
-        # Default Mode
+                # Row 1: anchor original + top matches
+                row_top = torch.cat([anchor_original.repeat(contrastive_top_k + 1, 1, 1, 1), top_matches], dim=0) if False else torch.cat(
+                    [anchor_original, top_matches], dim=0
+                )
+
+                # Row 2: anchor augment1 + top matches
+                row_top_aug = torch.cat([anchor_aug1, top_matches], dim=0)
+
+                # Row 3: anchor augment2 + bottom matches
+                row_bottom = torch.cat([anchor_aug2, bottom_matches], dim=0)
+
+                # Stack rows vertically
+                # We want a grid with 3 rows: [orig+top], [aug1+top], [aug2+bottom]
+                row_combined = torch.cat([row_top, row_top_aug, row_bottom], dim=0)
+
+                # make_grid with nrow = 1 + top_k
+                nrow = 1 + contrastive_top_k
+                fig = torchvision.utils.make_grid(row_combined, nrow=nrow, normalize=True, scale_each=True).cpu()
+                writer.add_image(f"{tag}-contrastive-anchor-{t_idx}", fig, step)
+
+        # Default Mode: restore training/eval mode
         self.train(mode=mode)
